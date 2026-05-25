@@ -1,0 +1,37 @@
+$buildDir = Join-Path $PSScriptRoot 'build'
+if (-not (Test-Path $buildDir)) {
+    New-Item -ItemType Directory -Path $buildDir | Out-Null
+}
+
+Write-Host "Building into $buildDir"
+$mainSrc = Join-Path $PSScriptRoot 'src\main.cpp'
+$testSrc = Join-Path $PSScriptRoot 'tests\test_ring_buffer.cpp'
+$mainExe = Join-Path $buildDir 'main.exe'
+$testExe = Join-Path $buildDir 'test_ring_buffer.exe'
+
+$gxx = 'C:\msys64\mingw64\bin\g++.exe'
+if (-not (Test-Path $gxx)) {
+    $gxx = (Get-Command g++ -ErrorAction Stop).Source
+}
+Write-Host "Using compiler: $gxx"
+
+# g++ spawns cc1plus, as, ld from its own bin directory at compile time.
+# If C:\MinGW\bin (or any other toolchain bin) shadows them on PATH, the
+# subprocess lookup picks up a mismatched binary and the build dies silently.
+$gxxDir = Split-Path -Parent $gxx
+if (($env:PATH -split ';')[0] -ne $gxxDir) {
+    $env:PATH = "$gxxDir;$env:PATH"
+}
+
+$commonArgs = @('-std=c++17', '-pthread',
+                '-static', '-static-libgcc', '-static-libstdc++')
+
+& $gxx @commonArgs $mainSrc -o $mainExe
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile main.cpp" }
+
+& $gxx @commonArgs $testSrc -o $testExe
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_ring_buffer.cpp" }
+
+Write-Host "Build complete. Executables:"
+Write-Host "  $mainExe"
+Write-Host "  $testExe"

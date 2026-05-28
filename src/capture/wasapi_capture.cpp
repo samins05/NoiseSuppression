@@ -47,6 +47,7 @@ void WasapiCapture::initialize() {
     if (hr != S_OK && hr != S_FALSE) {
         throwIfFailed(hr, "CoInitializeEx");
     }
+    comInitialized_ = true; // so shutdown() balances exactly one CoUninitialize, even if called twice
 
     // Find the default capture mic
     throwIfFailed(CoCreateInstance(
@@ -142,27 +143,7 @@ void WasapiCapture::run() {
             }
 
             const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-            const auto* samples = reinterpret_cast<const float*>(data);
-
-            for (UINT32 i = 0; i < numFrames; ++i) {
-                float mono = 0.0f;
-                // average channels (if multi-channel) into mono-audio : (L+R)/2 
-                if (!silent) {
-                    for (uint32_t c = 0; c < deviceChannels_; ++c) {
-                        mono += samples[i * deviceChannels_ + c];
-                    }
-                    mono /= static_cast<float>(deviceChannels_);
-                }
-                accumulator_[accumulatorPos_++] = mono;
-                if (accumulatorPos_ == kFrameSamples) {
-                    if (output_.write(accumulator_)) {
-                        framesProduced_.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        framesDropped_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    accumulatorPos_ = 0;
-                }
-            }
+            ingestSamples(reinterpret_cast<const float*>(data), numFrames, deviceChannels_, silent);
 
             captureClient_->ReleaseBuffer(numFrames); // release ASAP — we do not own this buffer
             captureClient_->GetNextPacketSize(&packetSize);
@@ -171,6 +152,28 @@ void WasapiCapture::run() {
 
     audioClient_->Stop();
     CoUninitialize();
+}
+
+void WasapiCapture::ingestSamples(const float* samples, uint32_t numFrames, uint32_t channels, bool silent) {
+    for (uint32_t i = 0; i < numFrames; ++i) {
+        float mono = 0.0f;
+        // average channels (if multi-channel) into mono audio: (L+R)/2
+        if (!silent) {
+            for (uint32_t c = 0; c < channels; ++c) {
+                mono += samples[i * channels + c];
+            }
+            mono /= static_cast<float>(channels);
+        }
+        accumulator_[accumulatorPos_++] = mono;
+        if (accumulatorPos_ == kFrameSamples) {
+            if (output_.write(accumulator_)) {
+                framesProduced_.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                framesDropped_.fetch_add(1, std::memory_order_relaxed);
+            }
+            accumulatorPos_ = 0;
+        }
+    }
 }
 
 void WasapiCapture::requestStop() {
@@ -186,5 +189,8 @@ void WasapiCapture::shutdown() {
     if (device_)        { device_->Release();        device_        = nullptr; }
     if (enumerator_)    { enumerator_->Release();    enumerator_    = nullptr; }
     if (eventHandle_)   { CloseHandle(static_cast<HANDLE>(eventHandle_)); eventHandle_ = nullptr; }
-    CoUninitialize();
+    if (comInitialized_) {
+        CoUninitialize();
+        comInitialized_ = false;
+    }
 }

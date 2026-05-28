@@ -21,7 +21,10 @@ A real-time, device-level noise suppression pipeline in C++. It sits between a p
 - **Toolchain:** MSYS2 MinGW-w64 GCC at `C:\msys64\mingw64\bin\g++.exe`. The compiler must use the **posix** thread model — `std::thread` is unsupported on win32-model GCC builds.
 - **Build:** `.\build.ps1` from the project root. The script pins the compiler by absolute path, prepends its bin directory to PATH so g++'s subprocesses (cc1plus, as, ld) resolve to the same toolchain, and links the C++ runtime statically (`-static -static-libgcc -static-libstdc++`) so the output `.exe` has no DLL dependencies.
 - **Run main:** `.\build\main.exe`.
-- **Run tests:** `.\build\test_ring_buffer.exe` (currently the only test). Expected output: `Ring buffer test passed: 100000 ordered items.`
+- **Run tests:**
+  - `.\build\test_ring_buffer.exe` — expected: `Ring buffer test passed: 100000 ordered items.`
+  - `.\build\test_wasapi_capture.exe` — expected: `WasapiCapture test passed: 7 cases (framing, mixing, silent, overflow).`
+  - `.\build\test_processing_stage.exe` — expected: `ProcessingStage test passed: 4 cases (flow, identity, order, overflow).`
 - Adding more tests means adding a corresponding `g++` invocation to [build.ps1](build.ps1) — there is no test discovery.
 
 ---
@@ -148,11 +151,15 @@ noise-suppressor/
 ├── src/
 │   ├── main.cpp                  # owns thread lifetime, creates RawAudioBuffer + CleanAudioBuffer
 │   ├── core/
+│   │   ├── audio_frame.h         # AudioFrame alias, shared by capture/suppressor/processing
 │   │   ├── ring_buffer.h
-│   │   └── ring_buffer.cpp
+│   │   └── ring_buffer.inl       # template defs, #included by ring_buffer.h (not compiled standalone)
 │   ├── capture/
 │   │   ├── wasapi_capture.h
 │   │   └── wasapi_capture.cpp
+│   ├── processing/
+│   │   ├── processing_stage.h    # owns the RawAudioBuffer → suppressor → CleanAudioBuffer loop
+│   │   └── processing_stage.cpp
 │   ├── playback/
 │   │   ├── wasapi_playback.h
 │   │   └── wasapi_playback.cpp
@@ -189,19 +196,30 @@ Files: [src/capture/wasapi_capture.h](src/capture/wasapi_capture.h), [src/captur
 - `WasapiCapture` is a passive component — it takes a `RingBuffer<AudioFrame>&` (the `RawAudioBuffer` allocated in `main()`) and exposes `initialize()` / `run()` / `requestStop()` / `shutdown()`. `main` owns the `std::thread` that runs `run()`; `requestStop()` flips an atomic and `SetEvent`s the WASAPI wake handle so the hot loop returns promptly.
 - The hot loop is the canonical WASAPI shared-mode event-driven pattern: `WaitForSingleObject` on the audio event → `GetBuffer` → mix down to mono → push into a 480-sample accumulator → `RingBuffer::write()` on every full frame → `ReleaseBuffer` ASAP. The Windows buffer is never held across the frame-emit logic.
 - COM interfaces (`IMMDeviceEnumerator`, `IMMDevice`, `IAudioClient`, `IAudioCaptureClient`) are **forward-declared in the header** and only `#include`d in the `.cpp`, so consumers of the header don't pull in `<windows.h>`.
-- Multichannel mics are averaged down to mono in the hot loop. Format is locked to the device's mix format (IEEE float; init throws if not). Sample rate is logged but not converted — a non-48 kHz device just produces a warning since the downstream RNNoise needs 48 kHz.
+- The sample→frame logic (mix multichannel down to mono, accumulate into 480-sample frames, write to the ring buffer) lives in `ingestSamples()`, split out of `run()` so it's unit-testable without hardware. `run()` is just the WASAPI event wrapper that hands packets to `ingestSamples`. Tests in [tests/test_wasapi_capture.cpp](tests/test_wasapi_capture.cpp) drive `ingestSamples` directly with synthetic buffers.
+- Format is locked to the device's mix format (IEEE float; init throws if not). Sample rate is logged but not converted — a non-48 kHz device just produces a warning since the downstream RNNoise needs 48 kHz.
 - `AUDCLNT_BUFFERFLAGS_SILENT` is honored (writes zeros instead of the buffer contents). Hot-swap recovery on `AUDCLNT_E_DEVICE_INVALIDATED` is a TODO — currently just logs and breaks.
 - Build linkage: [build.ps1](build.ps1) adds `-lole32 -lwinmm -lksuser`. `ksuser` is needed for the `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` GUID that `INITGUID` doesn't emit (mmreg/ksmedia use a different macro).
 - Verification: `.\build\main.exe` runs `WasapiCapture` for 10 s, draining frames from `RawAudioBuffer` in main and logging produced/consumed/dropped each second. Expected steady-state: `produced` climbs by ~100/sec (48000 / 480 = 100 frames per second), `dropped` stays at 0.
 
-### Phase 3 — Passthrough Pipeline
+> **Phase order note:** Phase 4 (suppressor) is implemented **before** Phase 3 (playback). The playback thread drains `CleanAudioBuffer`, which is empty until the processing stage writes to it — so the suppressor/processing wiring has to exist first, otherwise playback has nothing to test against.
+
+### Phase 4 — Suppressor + Processing Stage 🟡 passthrough slice DONE, DSP pending
+Files: [src/suppressor/suppressor.h](src/suppressor/suppressor.h), [src/suppressor/suppressor.cpp](src/suppressor/suppressor.cpp), [src/processing/processing_stage.h](src/processing/processing_stage.h), [src/processing/processing_stage.cpp](src/processing/processing_stage.cpp)
+- Split into two classes: **`Suppressor`** is the pure transform (`AudioFrame process(const AudioFrame&)`, no threads/buffers); **`ProcessingStage`** owns the read→process→write loop and holds `RawAudioBuffer&` + `CleanAudioBuffer&` + `Suppressor&`. `ProcessingStage` is passive like `WasapiCapture` (`run()` / `requestStop()`); `main` owns the processing `std::thread`.
+- First slice is **passthrough** — `Suppressor::process` returns its input unchanged. This verified the full capture→processing→clean wiring before any DSP exists. `process()` is a non-const member because the real pipeline will carry GRU hidden state + overlap-add tail between frames.
+- `ProcessingStage::run` yields when `RawAudioBuffer` is empty and counts drops if `CleanAudioBuffer` is full; no event handle needed since it's purely buffer-driven. The loop body is factored into `pumpOnce()` (read → suppress → write, one frame) so the flow is unit-testable without a thread — `run()` just calls it in a loop. Tests in [tests/test_processing_stage.cpp](tests/test_processing_stage.cpp).
+- Remaining DSP slice (still TODO): FFT (test in isolation against known values) → Bark conversion + feature extraction → GRU forward pass using Mozilla's weights → gain application + IFFT + overlap-add. Slots into `Suppressor::process` with zero changes to threading or buffers.
+- Verification: `.\build\main.exe` runs capture + processing threads; `captured` and `processed` both climb ~100/sec, `procDropped=0`.
+
+### Phase 3 — Passthrough Pipeline (playback)
 Files: wasapi_playback.h, wasapi_playback.cpp
-- Get playback thread reading CleanAudioBuffer and writing to VB-Cable
+- Get playback thread reading CleanAudioBuffer and writing to VB-Cable (replaces main's temporary drain loop as the consumer of CleanAudioBuffer)
 - Full passthrough: mic in → same audio out, no cleaning
 - Open Discord, select virtual mic, verify voice comes through
 - This is your first real end-to-end test
 
-### Phase 4 — RNNoise Suppressor
+### Phase 4 (DSP slice) — RNNoise internals
 Files: suppressor/, weights.h
 - Implement FFT first, test in isolation against known values
 - Add Bark conversion + feature extraction

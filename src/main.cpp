@@ -1,5 +1,7 @@
 #include "core/ring_buffer.h"
 #include "capture/wasapi_capture.h"
+#include "suppressor/suppressor.h"
+#include "processing/processing_stage.h"
 
 #include <chrono>
 #include <iostream>
@@ -8,12 +10,14 @@
 int main() {
 
     /*
-    Capture thread -> produces 100 frames/s (raw audio) -> RawAudioBuffer
+    Capture thread     -> produces 100 frames/s (raw audio)   -> RawAudioBuffer
+    Processing thread  -> drains RawAudioBuffer, suppresses    -> CleanAudioBuffer
+    main (for now)     -> drains CleanAudioBuffer, prints stats
     */
-    constexpr size_t frameBufferSize = 128; // frames that each ring buffer can hold 
+    constexpr size_t frameBufferSize = 128; // frames that each ring buffer can hold
     constexpr size_t LOOP_DURATION_SEC = 40;
     RingBuffer<AudioFrame> RawAudioBuffer(frameBufferSize);
-    RingBuffer<AudioFrame> CleanAudioBuffer(frameBufferSize); // reserved for Phase 3
+    RingBuffer<AudioFrame> CleanAudioBuffer(frameBufferSize);
 
     std::cout << "RawAudioBuffer capacity = "   << RawAudioBuffer.capacity()   << " frames\n";
     std::cout << "CleanAudioBuffer capacity = " << CleanAudioBuffer.capacity() << " frames\n";
@@ -26,33 +30,43 @@ int main() {
         return 1;
     }
 
-    // main owns all pipeline thread lifetimes. Phase 3 will add processing + playback threads
-    // alongside this one — keeping them in one place makes the concurrency model legible.
+    // Suppressor is the pure transform; ProcessingStage owns the loop that pumps
+    // RawAudioBuffer -> suppressor -> CleanAudioBuffer. (Passthrough for now.)
+    Suppressor suppressor;
+    ProcessingStage processing(RawAudioBuffer, CleanAudioBuffer, suppressor);
+
+    // main owns all pipeline thread lifetimes
     std::thread captureThread(&WasapiCapture::run, &capture);
+    std::thread processingThread(&ProcessingStage::run, &processing);
 
     using namespace std::chrono;
     AudioFrame drained;
-    uint64_t consumed = 0;
+    uint64_t cleanDrained = 0;
 
-    // drains the rawaudiobuffer every second and prints stats
-    // **draining the rawaudiobuffer will be a task only done by processing thread 
-    for (int sec = 1; sec <= LOOP_DURATION_SEC; ++sec) {
+    // Drain CleanAudioBuffer every second and print stats. main is the sole consumer of
+    // CleanAudioBuffer; the processing thread is the sole consumer of RawAudioBuffer.
+    // (Once Phase 3 lands, the playback thread takes over draining CleanAudioBuffer.)
+    for (size_t sec = 1; sec <= LOOP_DURATION_SEC; ++sec) {
         std::this_thread::sleep_for(seconds(1));
         size_t thisTick = 0;
-        while (RawAudioBuffer.read(drained)) {
+        while (CleanAudioBuffer.read(drained)) {
             ++thisTick;
-            ++consumed;
+            ++cleanDrained;
         }
         std::cout << "[t=" << sec << "s]"
-                  << " produced="  << capture.framesProduced()
-                  << " consumed="  << consumed
-                  << " this_tick=" << thisTick
-                  << " dropped="   << capture.framesDropped()
+                  << " captured="   << capture.framesProduced()
+                  << " processed="  << processing.framesProcessed()
+                  << " cleanDrained=" << cleanDrained
+                  << " this_tick="  << thisTick
+                  << " procDropped=" << processing.framesDropped()
                   << std::endl;
     }
 
+    // Stop the producer of RawAudioBuffer first so processing can drain the tail, then stop processing.
     capture.requestStop();
     captureThread.join();
-    capture.shutdown(); //runs from its destructor as main returns.
+    processing.requestStop();
+    processingThread.join();
+    capture.shutdown(); // idempotent; also runs from the destructor as main returns.
     return 0;
 }

@@ -1,8 +1,8 @@
 #pragma once
 
+#include "../core/audio_frame.h"
 #include "../core/ring_buffer.h"
 
-#include <array>
 #include <atomic>
 #include <cstdint>
 
@@ -11,9 +11,6 @@ struct IMMDeviceEnumerator;
 struct IMMDevice;
 struct IAudioClient;
 struct IAudioCaptureClient;
-
-// 10 ms of mono audio at 48 kHz : the frame size RNNoise requires downstream.
-using AudioFrame = std::array<float, 480>;
 
 // Passive WASAPI capture component. Owns the WASAPI handles and the hot-loop function;
 // does NOT own the std::thread that runs it. The caller (main.cpp) spawns a thread that
@@ -36,6 +33,11 @@ public:
     void run();          // Hot loop. Blocks until requestStop() is called.
     void requestStop();  // Set the stop flag and wake the hot loop. Safe to call from any thread.
 
+    // Accumulate audio into fixed 480-sample AudioFrames, and write each completed frame to the
+    // output ring buffer (bumping framesProduced/framesDropped) 
+    // ** USED BY HOT LOOP** 
+    void ingestSamples(const float* samples, uint32_t numFrames, uint32_t channels, bool silent);
+
     uint64_t framesProduced() const noexcept {
         return framesProduced_.load(std::memory_order_relaxed);
     }
@@ -55,6 +57,7 @@ private:
     IAudioClient*        audioClient_   = nullptr;
     IAudioCaptureClient* captureClient_ = nullptr;
     void*                eventHandle_   = nullptr; // HANDLE; void* keeps the header WinAPI-free.
+    bool                 comInitialized_ = false;  // tracks our CoInitializeEx so shutdown() is idempotent
 
     uint32_t deviceSampleRate_ = 0;
     uint32_t deviceChannels_   = 0;

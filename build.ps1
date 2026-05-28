@@ -4,10 +4,17 @@ if (-not (Test-Path $buildDir)) {
 }
 
 Write-Host "Building into $buildDir"
-$mainSrc = Join-Path $PSScriptRoot 'src\main.cpp'
-$testSrc = Join-Path $PSScriptRoot 'tests\test_ring_buffer.cpp'
-$mainExe = Join-Path $buildDir 'main.exe'
-$testExe = Join-Path $buildDir 'test_ring_buffer.exe'
+$mainSrc    = Join-Path $PSScriptRoot 'src\main.cpp'
+$captureSrc = Join-Path $PSScriptRoot 'src\capture\wasapi_capture.cpp'
+$testSrc    = Join-Path $PSScriptRoot 'tests\test_ring_buffer.cpp'
+$mainExe    = Join-Path $buildDir 'main.exe'
+$testExe    = Join-Path $buildDir 'test_ring_buffer.exe'
+
+# Windows audio link libs (only needed by main, not the test).
+# -lole32  : CoInitializeEx, CoCreateInstance, CoTaskMemFree
+# -lwinmm  : timing helpers / general MM linkage (paranoid include)
+# -lksuser : KSDATAFORMAT_SUBTYPE_IEEE_FLOAT (mmreg/ksmedia GUIDs INITGUID doesn't emit)
+$winAudioLibs = @('-lole32','-lwinmm','-lksuser')
 
 $gxx = 'C:\msys64\mingw64\bin\g++.exe'
 if (-not (Test-Path $gxx)) {
@@ -26,8 +33,8 @@ if (($env:PATH -split ';')[0] -ne $gxxDir) {
 $commonArgs = @('-std=c++17', '-pthread',
                 '-static', '-static-libgcc', '-static-libstdc++')
 
-& $gxx @commonArgs $mainSrc -o $mainExe
-if ($LASTEXITCODE -ne 0) { throw "Failed to compile main.cpp" }
+& $gxx @commonArgs $mainSrc $captureSrc -o $mainExe @winAudioLibs
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile main + capture" }
 
 & $gxx @commonArgs $testSrc -o $testExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_ring_buffer.cpp" }

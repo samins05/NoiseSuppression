@@ -64,22 +64,23 @@ Physical Mic
   - Prevents CPU reordering pointer increment before data is committed
 - bool write(float* frame) — returns false if full
 - bool read(float* frame) — returns false if empty
-- Two instances: rb1 (raw audio), rb2 (clean audio)
+- Two instances: `RawAudioBuffer` (mic → suppressor), `CleanAudioBuffer` (suppressor → playback)
 
 **Key Constraints:**
 - Fixed size decided at startup, never changes
 - Overflow: define behavior explicitly (drop oldest or drop newest)
-- Underflow on RB2 is more dangerous — outputs directly to playback. Output silence or repeat last frame
+- Underflow on CleanAudioBuffer is more dangerous — outputs directly to playback. Output silence or repeat last frame
 - Size directly controls latency: each frame held = 10ms added
 
 ---
 
 ### WASAPI Capture (src/capture/wasapi_capture.h)
-- Class: WasapiCapture — owns thread, WASAPI handles, lifetime
+- Class: WasapiCapture — owns WASAPI handles and the hot-loop function. The `std::thread` that runs `run()` is owned by [src/main.cpp](src/main.cpp); the class is a passive component.
+- Public lifecycle: `initialize()` → caller spawns `std::thread(&WasapiCapture::run, &capture)` → `requestStop()` + caller `join()`s → `shutdown()` (also runs from destructor). Destroying the object while a thread is still inside `run()` is asserted against.
 - Initialization chain: IMMDeviceEnumerator → IMMDevice → IAudioClient → IAudioCaptureClient
 - IAudioCaptureClient is the only interface the capture thread holds after init
 - Event-driven hot loop: thread sleeps via WaitForSingleObject until Windows signals frames are ready
-- On wakeup: GetBuffer() → copy to RB1 → ReleaseBuffer() immediately
+- On wakeup: GetBuffer() → copy to RawAudioBuffer → ReleaseBuffer() immediately
 - You do NOT own the Windows buffer — copy and release as fast as possible
 - Mode: shared (MVP), exclusive (post-MVP) — configurable parameter at init
 - MMCSS enrollment at thread startup (post-MVP but document where it goes)
@@ -98,7 +99,7 @@ Physical Mic
 - Uses Mozilla's pre-trained weights (weights.h — just a float array, no file loading)
 
 **Pipeline (must complete in < 10ms):**
-1. Receive raw frame from RB1
+1. Receive raw frame from RawAudioBuffer
 2. FFT — convert 480 time-domain samples to frequency spectrum (identify voice vs noise bands)
 3. Bark Scale Conversion — compress FFT bins into 22 bands matching human hearing
 4. Feature Extraction — compute energy per band + frame-to-frame energy changes
@@ -106,7 +107,7 @@ Physical Mic
 6. Apply Gains — multiply each frequency band by gain (noise attenuated, voice preserved)
 7. Inverse FFT — convert back to 480 time-domain samples
 8. Overlap-Add — blend edges of adjacent frames to eliminate click artifacts
-9. Write clean frame to RB2
+9. Write clean frame to CleanAudioBuffer
 
 **Key Constraints:**
 - GRU is stateful — hidden state persists between frames, never reset mid-session
@@ -125,7 +126,7 @@ Physical Mic
 
 ### VB-Cable Playback (src/playback/wasapi_playback.h)
 - Class: WasapiPlayback — mirror of WasapiCapture, opposite direction
-- Reads clean frames from RB2 at a fixed steady rate
+- Reads clean frames from CleanAudioBuffer at a fixed steady rate
 - Writes to VB-Cable virtual device which apps see as a normal mic
 - Playback thread runs on strict clock — cannot wait, cannot skip
 
@@ -133,9 +134,11 @@ Physical Mic
 
 ## Threading Model
 Three concurrent threads, communicate only through ring buffers:
-- **Capture thread** — feeds RB1
-- **Processing thread** — drains RB1, runs suppressor, feeds RB2
-- **Playback thread** — drains RB2, writes to virtual device
+- **Capture thread** — feeds RawAudioBuffer
+- **Processing thread** — drains RawAudioBuffer, runs suppressor, feeds CleanAudioBuffer
+- **Playback thread** — drains CleanAudioBuffer, writes to virtual device
+
+The two ring buffer instances are named **RawAudioBuffer** (mic → suppressor) and **CleanAudioBuffer** (suppressor → playback). Never abbreviate to `rb1` / `rb2`.
 
 ---
 
@@ -143,7 +146,7 @@ Three concurrent threads, communicate only through ring buffers:
 ```
 noise-suppressor/
 ├── src/
-│   ├── main.cpp                  # owns thread lifetime, creates rb1 + rb2
+│   ├── main.cpp                  # owns thread lifetime, creates RawAudioBuffer + CleanAudioBuffer
 │   ├── core/
 │   │   ├── ring_buffer.h
 │   │   └── ring_buffer.cpp
@@ -181,15 +184,19 @@ Files: [src/core/ring_buffer.h](src/core/ring_buffer.h), [src/core/ring_buffer.c
 - **Template pattern:** the header `#include`s `ring_buffer.cpp` at the bottom so all template definitions live in one logical unit. Do **not** add `ring_buffer.cpp` to the compile list in [build.ps1](build.ps1) — it would compile as an empty translation unit.
 - Test exercises 100k items through a 128-capacity buffer, asserts strict ordering. Run via `.\build\test_ring_buffer.exe`.
 
-### Phase 2 — WASAPI Capture
-Files: wasapi_capture.h, wasapi_capture.cpp
-- Get real mic audio flowing into RB1
-- Processing thread just copies RB1 → RB2 directly, no suppression yet
-- Verify frames arrive correctly and timing is stable
+### Phase 2 — WASAPI Capture ✅ DONE
+Files: [src/capture/wasapi_capture.h](src/capture/wasapi_capture.h), [src/capture/wasapi_capture.cpp](src/capture/wasapi_capture.cpp)
+- `WasapiCapture` is a passive component — it takes a `RingBuffer<AudioFrame>&` (the `RawAudioBuffer` allocated in `main()`) and exposes `initialize()` / `run()` / `requestStop()` / `shutdown()`. `main` owns the `std::thread` that runs `run()`; `requestStop()` flips an atomic and `SetEvent`s the WASAPI wake handle so the hot loop returns promptly.
+- The hot loop is the canonical WASAPI shared-mode event-driven pattern: `WaitForSingleObject` on the audio event → `GetBuffer` → mix down to mono → push into a 480-sample accumulator → `RingBuffer::write()` on every full frame → `ReleaseBuffer` ASAP. The Windows buffer is never held across the frame-emit logic.
+- COM interfaces (`IMMDeviceEnumerator`, `IMMDevice`, `IAudioClient`, `IAudioCaptureClient`) are **forward-declared in the header** and only `#include`d in the `.cpp`, so consumers of the header don't pull in `<windows.h>`.
+- Multichannel mics are averaged down to mono in the hot loop. Format is locked to the device's mix format (IEEE float; init throws if not). Sample rate is logged but not converted — a non-48 kHz device just produces a warning since the downstream RNNoise needs 48 kHz.
+- `AUDCLNT_BUFFERFLAGS_SILENT` is honored (writes zeros instead of the buffer contents). Hot-swap recovery on `AUDCLNT_E_DEVICE_INVALIDATED` is a TODO — currently just logs and breaks.
+- Build linkage: [build.ps1](build.ps1) adds `-lole32 -lwinmm -lksuser`. `ksuser` is needed for the `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` GUID that `INITGUID` doesn't emit (mmreg/ksmedia use a different macro).
+- Verification: `.\build\main.exe` runs `WasapiCapture` for 10 s, draining frames from `RawAudioBuffer` in main and logging produced/consumed/dropped each second. Expected steady-state: `produced` climbs by ~100/sec (48000 / 480 = 100 frames per second), `dropped` stays at 0.
 
 ### Phase 3 — Passthrough Pipeline
 Files: wasapi_playback.h, wasapi_playback.cpp
-- Get playback thread reading RB2 and writing to VB-Cable
+- Get playback thread reading CleanAudioBuffer and writing to VB-Cable
 - Full passthrough: mic in → same audio out, no cleaning
 - Open Discord, select virtual mic, verify voice comes through
 - This is your first real end-to-end test
@@ -200,7 +207,7 @@ Files: suppressor/, weights.h
 - Add Bark conversion + feature extraction
 - Add GRU forward pass using Mozilla's weights
 - Add gain application + IFFT + overlap-add
-- Plug into processing thread between RB1 and RB2
+- Plug into processing thread between RawAudioBuffer and CleanAudioBuffer
 - Verify before/after by writing WAV files and listening
 
 ---
@@ -225,7 +232,7 @@ Files: suppressor/, weights.h
 ## Key Things To Know Going In
 - You do not own the WASAPI buffer — copy immediately and release
 - Write pointer increment is the signal to the consumer thread — data must be fully written before pointer increments (acquire/release memory ordering)
-- RB2 underflow is more dangerous than RB1 overflow — playback thread cannot wait
+- CleanAudioBuffer underflow is more dangerous than RawAudioBuffer overflow — playback thread cannot wait
 - GRU hidden state must persist between frames — never reset it mid-session
 - Overlap-Add is not optional — without it you get 100 audible clicks per second
 - Buffer size is a latency tradeoff — each frame in buffer = 10ms latency added

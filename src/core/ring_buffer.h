@@ -5,7 +5,9 @@
 #include <memory>
 #include <type_traits>
 
-// Single-producer, single-consumer lock-free ring buffer.
+// SPSC CONTRACT ****
+// Only one thread can read from ringbuffer instance
+// Only one thread can write to ringbuffer instance
 // The buffer capacity is configurable at construction and the implementation
 // never blocks: write() returns false when full, read() returns false when empty.
 
@@ -26,6 +28,7 @@ public:
     size_t capacity() const noexcept { return capacity_ - 1; }
 
 private:
+    // enforces the circular queue behavior by wrapping around the index
     size_t next_index(size_t index) const noexcept {
         return (index + 1) % capacity_;
     }
@@ -36,4 +39,4 @@ private:
     std::atomic<size_t> read_ptr_{0};
 };
 
-#include "ring_buffer.cpp"
+#include "ring_buffer.inl"

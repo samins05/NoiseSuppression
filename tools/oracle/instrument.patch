@@ -1,0 +1,71 @@
+diff --git a/src/denoise.c b/src/denoise.c
+index ec9bc41..59a1e59 100644
+--- a/src/denoise.c
++++ b/src/denoise.c
+@@ -455,6 +455,39 @@ static void pitch_filter(kiss_fft_cpx *X, const kiss_fft_cpx *P, const float *Ex
+   }
+ }
+ 
++/* ---- oracle instrumentation (added for NoiseSuppression project verification) ----
++   When the RNNOISE_DUMP env var names a file, dump per-stage intermediates for each
++   frame so our reimplementation can diff against this reference. Text, one block/frame:
++     FRAME silence=<0|1> vad=<f>
++     Ex   <22 band energies>
++     FEAT <42 features fed to the RNN>
++     GRNN <22 raw gains straight out of compute_rnn>
++     GFIN <22 final gains after pitch_filter + smoothing (what actually gets applied)>
++   No-op unless RNNOISE_DUMP is set, so the pristine denoise path is unaffected. */
++static FILE *rnnoise_dump_file(void) {
++  static FILE *f = NULL;
++  static int tried = 0;
++  if (!tried) {
++    const char *path = getenv("RNNOISE_DUMP");
++    if (path) f = fopen(path, "wb");
++    tried = 1;
++  }
++  return f;
++}
++static void rnnoise_dump_frame(const float *features, const float *g_rnn,
++                               const float *g_final, const float *Ex,
++                               int silence, float vad) {
++  int i;
++  FILE *f = rnnoise_dump_file();
++  if (!f) return;
++  fprintf(f, "FRAME silence=%d vad=%.9g\n", silence, vad);
++  fprintf(f, "Ex");   for (i=0;i<NB_BANDS;i++)    fprintf(f, " %.9g", Ex[i]);       fprintf(f, "\n");
++  fprintf(f, "FEAT"); for (i=0;i<NB_FEATURES;i++) fprintf(f, " %.9g", features[i]); fprintf(f, "\n");
++  fprintf(f, "GRNN"); for (i=0;i<NB_BANDS;i++)    fprintf(f, " %.9g", g_rnn[i]);    fprintf(f, "\n");
++  fprintf(f, "GFIN"); for (i=0;i<NB_BANDS;i++)    fprintf(f, " %.9g", g_final[i]);  fprintf(f, "\n");
++}
++/* ---- end oracle instrumentation ---- */
++
+ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+   int i;
+   kiss_fft_cpx X[FREQ_SIZE];
+@@ -464,6 +497,7 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+   float Exp[NB_BANDS];
+   float features[NB_FEATURES];
+   float g[NB_BANDS];
++  float g_rnn[NB_BANDS];   /* raw RNN gains, snapshotted before pitch_filter/smoothing (oracle) */
+   float gf[FREQ_SIZE]={1};
+   float vad_prob = 0;
+   int silence;
+@@ -472,8 +506,10 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+   biquad(x, st->mem_hp_x, in, b_hp, a_hp, FRAME_SIZE);
+   silence = compute_frame_features(st, X, P, Ex, Ep, Exp, features, x);
+ 
++  for (i=0;i<NB_BANDS;i++) { g[i] = 0; g_rnn[i] = 0; }  /* defined values for the silence-frame dump */
+   if (!silence) {
+     compute_rnn(&st->rnn, g, &vad_prob, features);
++    for (i=0;i<NB_BANDS;i++) g_rnn[i] = g[i];   /* snapshot raw RNN output for Slice 6 verification */
+     pitch_filter(X, P, Ex, Ep, Exp, g);
+     for (i=0;i<NB_BANDS;i++) {
+       float alpha = .6f;
+@@ -489,6 +525,7 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
+ #endif
+   }
+ 
++  rnnoise_dump_frame(features, g_rnn, g, Ex, silence, vad_prob);
+   frame_synthesis(st, out, X);
+   return vad_prob;
+ }

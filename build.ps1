@@ -11,10 +11,12 @@ $processingSrc = Join-Path $PSScriptRoot 'src\processing\processing_stage.cpp'
 $testSrc       = Join-Path $PSScriptRoot 'tests\test_ring_buffer.cpp'
 $captureTestSrc = Join-Path $PSScriptRoot 'tests\test_wasapi_capture.cpp'
 $processingTestSrc = Join-Path $PSScriptRoot 'tests\test_processing_stage.cpp'
+$wavIoTestSrc = Join-Path $PSScriptRoot 'tests\test_wav_io.cpp'
 $mainExe    = Join-Path $buildDir 'main.exe'
 $testExe    = Join-Path $buildDir 'test_ring_buffer.exe'
 $captureTestExe = Join-Path $buildDir 'test_wasapi_capture.exe'
 $processingTestExe = Join-Path $buildDir 'test_processing_stage.exe'
+$wavIoTestExe = Join-Path $buildDir 'test_wav_io.exe'
 
 # Windows audio link libs (only needed by main, not the test).
 # -lole32  : CoInitializeEx, CoCreateInstance, CoTaskMemFree
@@ -51,8 +53,13 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wasapi_capture" }
 & $gxx @commonArgs $processingTestSrc $processingSrc $suppressorSrc -o $processingTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_processing_stage" }
 
+# Header-only WAV/raw-PCM helper (tests/wav_io.h) — offline test support, no extra .cpp.
+& $gxx @commonArgs $wavIoTestSrc -o $wavIoTestExe
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wav_io" }
+
 Write-Host "Build complete. Executables:"
 Write-Host "  $mainExe"
 Write-Host "  $testExe"
 Write-Host "  $captureTestExe"
 Write-Host "  $processingTestExe"
+Write-Host "  $wavIoTestExe"

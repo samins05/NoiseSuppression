@@ -1,2 +1,5 @@
 # Ignore generated build artifacts
 build/
+
+# External oracle clone — reproduced via tools/oracle/setup.sh, not committed
+third_party/

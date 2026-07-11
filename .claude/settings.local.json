@@ -27,7 +27,14 @@
       "PowerShell(Write-Output '--- Should be empty \\(no MinGW/PATH/compile_error mentions\\) ---'; \\(Get-Content CLAUDE.md\\) | Select-String -Pattern 'MinGW|compile_error' -CaseSensitive:$false; Write-Output '--- Should have matches ---'; \\(Get-Content CLAUDE.md\\) | Select-String -Pattern 'build\\\\.ps1|MSYS2|posix' | ForEach-Object { \"$\\($_.LineNumber\\): $\\($_.Line.Trim\\(\\)\\)\" })",
       "PowerShell(.\\\\build\\\\main.exe; Write-Output \"EXIT=$LASTEXITCODE\")",
       "PowerShell(.\\\\build.ps1; Write-Output '--- running capture test ---'; .\\\\build\\\\test_wasapi_capture.exe; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output '--- ring buffer test still ok ---'; .\\\\build\\\\test_ring_buffer.exe; Write-Output \"EXIT=$LASTEXITCODE\")",
-      "PowerShell(.\\\\build.ps1; Write-Output '--- processing test ---'; .\\\\build\\\\test_processing_stage.exe; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output '--- capture test ---'; .\\\\build\\\\test_wasapi_capture.exe; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output '--- ring buffer test ---'; .\\\\build\\\\test_ring_buffer.exe; Write-Output \"EXIT=$LASTEXITCODE\")"
+      "PowerShell(.\\\\build.ps1; Write-Output '--- processing test ---'; .\\\\build\\\\test_processing_stage.exe; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output '--- capture test ---'; .\\\\build\\\\test_wasapi_capture.exe; Write-Output \"EXIT=$LASTEXITCODE\"; Write-Output '--- ring buffer test ---'; .\\\\build\\\\test_ring_buffer.exe; Write-Output \"EXIT=$LASTEXITCODE\")",
+      "PowerShell(.\\\\build\\\\test_ring_buffer.exe; .\\\\build\\\\test_wasapi_capture.exe; .\\\\build\\\\test_processing_stage.exe)",
+      "Skill(code-review)",
+      "Bash(git ls-remote *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git clone *)",
+      "PowerShell(.\\\\build.ps1 2>&1 | Select-Object -Last 8; Write-Host \"=== run wav_io test ===\"; $env:WAV_TEST_DIR=$env:TEMP; .\\\\build\\\\test_wav_io.exe)",
+      "Bash(sh tools/oracle/setup.sh)"
     ]
   }
 }

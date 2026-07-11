@@ -25,7 +25,10 @@ A real-time, device-level noise suppression pipeline in C++. It sits between a p
   - `.\build\test_ring_buffer.exe` — expected: `Ring buffer test passed: 100000 ordered items.`
   - `.\build\test_wasapi_capture.exe` — expected: `WasapiCapture test passed: 7 cases (framing, mixing, silent, overflow).`
   - `.\build\test_processing_stage.exe` — expected: `ProcessingStage test passed: 4 cases (flow, identity, order, overflow).`
+  - `.\build\test_wav_io.exe` — expected: `wav_io test passed: 4 cases (wav rt, raw rt, header size, clamp).` Set `WAV_TEST_DIR` to a writable dir (defaults to `.`), e.g. `$env:WAV_TEST_DIR=$env:TEMP`.
 - Adding more tests means adding a corresponding `g++` invocation to [build.ps1](build.ps1) — there is no test discovery.
+
+- **Golden oracle (test-only):** the suppressor DSP is verified by diffing against a reference RNNoise build, not by eyeballing. Build it once with `sh tools/oracle/setup.sh` (see [tools/oracle/README.md](tools/oracle/README.md)). It clones **RNNoise v0.1.1** into `third_party/` (gitignored), applies [tools/oracle/instrument.patch](tools/oracle/instrument.patch), and produces `rnnoise_demo.exe`. Running it with `RNNOISE_DUMP=dump.txt` emits per-frame `Ex[22]`, `features[42]`, raw RNN gains, and final gains for stage-by-stage comparison. The oracle speaks raw 16-bit PCM; bridge via `wav_io::writeRawPcm16` / `readRawPcm16`.
 
 ---
 
@@ -37,9 +40,9 @@ A real-time, device-level noise suppression pipeline in C++. It sits between a p
 - Output cleaned audio to a virtual device any app can use
 
 ### Non-Functional Requirements
-- End-to-end latency < 20ms
+- End-to-end latency < 20ms (eventual target; while building the DSP we run a lenient 30–50ms budget and tighten later — this is a home project, not Discord-grade)
 - No audible glitches after hours of use
-- No dynamic memory allocation after startup
+- No dynamic memory allocation after startup (test-only code like `tests/wav_io.h` and the oracle are exempt — they never run in the real-time path)
 
 ### High Level Pipeline
 ```
@@ -101,29 +104,44 @@ Physical Mic
 - Interface: takes raw PCM frame in, returns clean PCM frame out
 - Uses Mozilla's pre-trained weights (weights.h — just a float array, no file loading)
 
-**Pipeline (must complete in < 10ms):**
-1. Receive raw frame from RawAudioBuffer
-2. FFT — convert 480 time-domain samples to frequency spectrum (identify voice vs noise bands)
-3. Bark Scale Conversion — compress FFT bins into 22 bands matching human hearing
-4. Feature Extraction — compute energy per band + frame-to-frame energy changes
-5. GRU Forward Pass — feed features into network, outputs 22 gain values (0.0–1.0 per band)
-6. Apply Gains — multiply each frequency band by gain (noise attenuated, voice preserved)
-7. Inverse FFT — convert back to 480 time-domain samples
-8. Overlap-Add — blend edges of adjacent frames to eliminate click artifacts
+**Fidelity decision — faithful RNNoise v0.1.1, not the simplified sketch.** We reproduce
+the classic RNNoise DSP exactly so the pretrained weights actually work. The weights expect
+a specific **42-element feature vector** (`NB_BANDS + 3*NB_DELTA_CEPS + 2 = 22 + 18 + 2`),
+NOT just band energies. Feeding a different feature set produces garbage gains. Concretely:
+- **22 BFCC** (log band energies → DCT), **6 deltas + 6 delta-deltas** of the first 6 BFCC,
+  **1 pitch period**, **6 pitch-correlation cepstral coeffs**, **1 spectral non-stationarity**.
+- Pitch features require **pitch detection** (autocorrelation search) over a rolling history
+  buffer of past samples — the single biggest chunk of DSP and exactly what a "band energy only"
+  sketch omits.
+- Analysis is over a **960-sample window** (2×480, 50% overlap), so the FFT is **size 960 —
+  NOT a power of two**; radix-2 Cooley-Tukey alone won't do it (this is why RNNoise ships KISS FFT).
+- **Scale convention:** RNNoise operates on int16-magnitude floats (band energies ~1e6), while
+  WASAPI capture gives `[-1, 1]`. Integration (Slice 7) scales ×32768 in, ÷32768 out.
+
+**Pipeline (target < 10ms; lenient 30–50ms budget while building, tighten later):**
+1. Receive raw frame from RawAudioBuffer; append to the rolling history buffer
+2. High-pass filter, window into the 960-sample analysis frame, FFT → spectrum
+3. Bark conversion → 22 band energies; pitch search → pitch-filtered spectrum
+4. Feature extraction → the 42-element vector above (carries last-frame memory for deltas)
+5. GRU forward pass → 22 band gains (0.0–1.0)
+6. Pitch filter + gain smoothing, interpolate 22 band gains to FFT bins, apply
+7. Inverse FFT → time domain
+8. Overlap-add with previous frame tail → 480 clean samples
 9. Write clean frame to CleanAudioBuffer
 
 **Key Constraints:**
 - GRU is stateful — hidden state persists between frames, never reset mid-session
 - Overlap-Add requires previous frame tail in memory — pre-allocate one extra frame
-- FFT size fixed by frame size — 480 samples in, fixed FFT size out
-- Pipeline must complete in < 10ms — next frame arrives regardless
+- Pitch needs a rolling history buffer (~768+ samples) — Suppressor-private, single-threaded
+  (NOT a ring buffer; only the processing thread touches it, so no atomics/ordering needed)
+- Verified stage-by-stage against the golden oracle (see Build & Run) — every slice has a gate
 
 **File breakdown:**
 - suppressor.cpp — wires full pipeline
-- fft.h/cpp — FFT + IFFT (implement Cooley-Tukey or use FFTW)
-- bark.h/cpp — Bark scale conversion + feature extraction
+- fft.h/cpp — 960-pt mixed-radix FFT + IFFT (port KISS FFT; power-of-two radix-2 is insufficient)
+- bark.h/cpp — Bark conversion + feature extraction (incl. pitch features)
 - gru.h/cpp — GRU forward pass (matrix multiply + tanh/sigmoid activations)
-- weights.h — Mozilla's pre-trained weights as float array
+- weights.h — Mozilla's pre-trained weights as float array (from RNNoise v0.1.1 rnn_data.c)
 
 ---
 
@@ -172,9 +190,18 @@ noise-suppressor/
 │       └── weights.h
 ├── tests/
 │   ├── test_ring_buffer.cpp
+│   ├── test_wasapi_capture.cpp
+│   ├── test_processing_stage.cpp
+│   ├── wav_io.h                  # header-only WAV/raw-PCM I/O, offline test support (Slice 0)
+│   ├── test_wav_io.cpp
 │   ├── test_fft.cpp
-│   ├── test_suppressor.cpp
-│   └── test_passthrough.cpp
+│   └── test_suppressor.cpp
+├── tools/
+│   └── oracle/                   # reproducible RNNoise golden-reference build (Slice 0)
+│       ├── setup.sh              # clones v0.1.1 -> third_party/, patches, builds rnnoise_demo.exe
+│       ├── instrument.patch      # RNNOISE_DUMP-gated per-frame dump hook
+│       └── README.md
+├── third_party/                 # gitignored — oracle clone, rebuilt via tools/oracle/setup.sh
 └── docs/
     └── system_design.md
 ```
@@ -219,14 +246,35 @@ Files: wasapi_playback.h, wasapi_playback.cpp
 - Open Discord, select virtual mic, verify voice comes through
 - This is your first real end-to-end test
 
-### Phase 4 (DSP slice) — RNNoise internals
-Files: suppressor/, weights.h
-- Implement FFT first, test in isolation against known values
-- Add Bark conversion + feature extraction
-- Add GRU forward pass using Mozilla's weights
-- Add gain application + IFFT + overlap-add
-- Plug into processing thread between RawAudioBuffer and CleanAudioBuffer
-- Verify before/after by writing WAV files and listening
+### Phase 4 (DSP slice) — RNNoise internals — verification-first, sliced
+Files: suppressor/, weights.h, tests/, tools/oracle/
+
+Built as small slices, each ending in a **gate** — a specific assertion that must pass before
+the next slice starts. The DSP is developed and verified **offline** (WAV in → WAV out, diffed
+against the golden oracle), decoupled from playback (Phase 3) and live audio. See the task list
+and [tools/oracle/README.md](tools/oracle/README.md) for which slice diffs against which dump.
+
+- **Slice 0 ✅ DONE — Oracle + WAV harness.** Reproducible RNNoise v0.1.1 oracle
+  ([tools/oracle/setup.sh](tools/oracle/setup.sh) + [instrument.patch](tools/oracle/instrument.patch))
+  dumping `Ex[22]`/`features[42]`/raw+final gains; header-only WAV/raw-PCM I/O
+  ([tests/wav_io.h](tests/wav_io.h), [tests/test_wav_io.cpp](tests/test_wav_io.cpp)).
+  Gate met: oracle rebuilds from scratch and dumps 42 features/frame; WAV round-trip is bit-exact.
+- **Slice 1 — FFT/IFFT** (`fft.h/cpp`). 960-pt mixed-radix (port KISS FFT). Gate: impulse→flat,
+  sine→single bin, `IFFT(FFT(x))==x`, Parseval, matches naive O(n²) DFT within epsilon.
+- **Slice 2 — Perfect reconstruction.** Window + overlap-add scaffold in `Suppressor` with gains
+  forced to 1.0. Gate: output==input (one-frame delay), SNR > ~100 dB. *Highest-leverage test.*
+- **Slice 3 — Bark bands + energies** (`bark.h/cpp` pt1). Gate: energy conservation + `Ex[22]`
+  matches oracle.
+- **Slice 4 — Features: BFCC + deltas** (`bark.h/cpp` pt2). 34 of 42 features. Gate: `features[0..33]`
+  match oracle.
+- **Slice 5 — Pitch features.** Rolling history buffer + autocorrelation pitch search → final 8
+  features. Gate: full 42-vector matches oracle over a whole file. *Make-or-break slice.*
+- **Slice 6 — GRU network** (`gru.h/cpp` + `weights.h`). Gate: tiny hand-computed matmul cases,
+  then layer-by-layer gains match oracle's `GRNN` given oracle's feature vector.
+- **Slice 7 — Gain application + integration.** Full `Suppressor::process`; ×32768 scale bridge.
+  Gate: output matches oracle `clean.pcm` over a file + audible denoising.
+- **Slice 8 — Real-time wiring + perf.** Gate: `process()` within budget (lenient 30–50 ms first,
+  tighten later), no post-startup allocation, live pipeline stable with `procDropped=0`.
 
 ---
 

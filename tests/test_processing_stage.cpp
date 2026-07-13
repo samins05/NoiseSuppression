@@ -14,7 +14,9 @@ AudioFrame makeFrame(float v) {
     return f;
 }
 
-// A single frame flows Raw -> Clean and the counters reflect it.
+// A single frame flows Raw -> Clean and the counters reflect it. The Suppressor is no longer
+// identity (it's the STFT scaffold), so we check the output against a reference run of the same
+// transform rather than a hardcoded value — this test is about the pump-loop wiring, not the DSP.
 void test_single_frame_flows() {
     RingBuffer<AudioFrame> raw(8), clean(8);
     Suppressor sup;
@@ -25,45 +27,51 @@ void test_single_frame_flows() {
     assert(ps.framesProcessed() == 1);
     assert(ps.framesDropped() == 0);
 
+    Suppressor ref;
+    AudioFrame expected = ref.process(makeFrame(1.0f));
+
     AudioFrame f;
     assert(clean.read(f));
-    for (float x : f) assert(x == 1.0f);
-    assert(!raw.read(f)); // input was consumed
+    assert(f == expected); // pump ran the suppressor and forwarded its exact output
+    assert(!raw.read(f));  // input was consumed
 }
 
-// Passthrough suppressor preserves the frame exactly.
-void test_passthrough_identity() {
+// An empty input buffer is a no-op: pumpOnce returns false, produces no output, counters stay 0.
+void test_empty_input_is_noop() {
     RingBuffer<AudioFrame> raw(8), clean(8);
     Suppressor sup;
     ProcessingStage ps(raw, clean, sup);
 
-    AudioFrame in;
-    for (size_t i = 0; i < in.size(); ++i) in[i] = static_cast<float>(i) * 0.01f;
-    assert(raw.write(in));
+    assert(!ps.pumpOnce()); // nothing to read
+    assert(ps.framesProcessed() == 0);
+    assert(ps.framesDropped() == 0);
 
-    assert(ps.pumpOnce());
-    AudioFrame out;
-    assert(clean.read(out));
-    assert(out == in); // std::array compares element-wise
+    AudioFrame f;
+    assert(!clean.read(f)); // nothing produced
 }
 
-// Multiple frames preserve order.
+// Multiple frames pass through in order, one output per input. Verified against a reference
+// Suppressor fed the same frames in the same order (deterministic transform -> bit-identical).
 void test_multiple_frames_in_order() {
     RingBuffer<AudioFrame> raw(8), clean(8);
     Suppressor sup;
     ProcessingStage ps(raw, clean, sup);
 
-    assert(raw.write(makeFrame(1.0f)));
-    assert(raw.write(makeFrame(2.0f)));
-    assert(raw.write(makeFrame(3.0f)));
+    AudioFrame a = makeFrame(1.0f), b = makeFrame(2.0f), c = makeFrame(3.0f);
+    assert(raw.write(a));
+    assert(raw.write(b));
+    assert(raw.write(c));
 
     for (int i = 0; i < 3; ++i) assert(ps.pumpOnce());
     assert(ps.framesProcessed() == 3);
 
+    Suppressor ref;
+    AudioFrame ea = ref.process(a), eb = ref.process(b), ec = ref.process(c);
+
     AudioFrame f;
-    assert(clean.read(f)); assert(f[0] == 1.0f);
-    assert(clean.read(f)); assert(f[0] == 2.0f);
-    assert(clean.read(f)); assert(f[0] == 3.0f);
+    assert(clean.read(f)); assert(f == ea);
+    assert(clean.read(f)); assert(f == eb);
+    assert(clean.read(f)); assert(f == ec);
 }
 
 // When Clean is full, the extra frame is dropped and counted (input still consumed).
@@ -83,10 +91,10 @@ void test_drop_when_clean_full() {
 
 int main() {
     test_single_frame_flows();
-    test_passthrough_identity();
+    test_empty_input_is_noop();
     test_multiple_frames_in_order();
     test_drop_when_clean_full();
 
-    std::cout << "ProcessingStage test passed: 4 cases (flow, identity, order, overflow)." << std::endl;
+    std::cout << "ProcessingStage test passed: 4 cases (flow, empty-input, order, overflow)." << std::endl;
     return 0;
 }

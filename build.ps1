@@ -15,6 +15,7 @@ $wavIoTestSrc = Join-Path $PSScriptRoot 'tests\test_wav_io.cpp'
 $fftSrc        = Join-Path $PSScriptRoot 'src\suppressor\fft.cpp'
 $kissSrc       = Join-Path $PSScriptRoot 'src\suppressor\kiss\kiss_fft.c'
 $fftTestSrc    = Join-Path $PSScriptRoot 'tests\test_fft.cpp'
+$suppressorTestSrc = Join-Path $PSScriptRoot 'tests\test_suppressor.cpp'
 $mainExe    = Join-Path $buildDir 'main.exe'
 $testExe    = Join-Path $buildDir 'test_ring_buffer.exe'
 $captureTestExe = Join-Path $buildDir 'test_wasapi_capture.exe'
@@ -22,6 +23,7 @@ $processingTestExe = Join-Path $buildDir 'test_processing_stage.exe'
 $wavIoTestExe = Join-Path $buildDir 'test_wav_io.exe'
 $kissObj    = Join-Path $buildDir 'kiss_fft.o'
 $fftTestExe = Join-Path $buildDir 'test_fft.exe'
+$suppressorTestExe = Join-Path $buildDir 'test_suppressor.exe'
 
 # Windows audio link libs (only needed by main, not the test).
 # -lole32  : CoInitializeEx, CoCreateInstance, CoTaskMemFree
@@ -54,7 +56,12 @@ if (($env:PATH -split ';')[0] -ne $gxxDir) {
 $commonArgs = @('-std=c++17', '-pthread',
                 '-static', '-static-libgcc', '-static-libstdc++')
 
-& $gxx @commonArgs $mainSrc $captureSrc $suppressorSrc $processingSrc -o $mainExe @winAudioLibs
+# Vendored KISS FFT -> C object first: the Suppressor (via fft.cpp) now links against it, so it
+# must exist before the main/processing/suppressor links below.
+& $gcc -O2 -c $kissSrc -o $kissObj
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile kiss_fft.c" }
+
+& $gxx @commonArgs $mainSrc $captureSrc $suppressorSrc $processingSrc $fftSrc $kissObj -o $mainExe @winAudioLibs
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile main + capture + suppressor + processing" }
 
 & $gxx @commonArgs $testSrc -o $testExe
@@ -63,19 +70,19 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_ring_buffer.cpp" }
 & $gxx @commonArgs $captureTestSrc $captureSrc -o $captureTestExe @winAudioLibs
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wasapi_capture" }
 
-& $gxx @commonArgs $processingTestSrc $processingSrc $suppressorSrc -o $processingTestExe
+& $gxx @commonArgs $processingTestSrc $processingSrc $suppressorSrc $fftSrc $kissObj -o $processingTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_processing_stage" }
 
 # Header-only WAV/raw-PCM helper (tests/wav_io.h) — offline test support, no extra .cpp.
 & $gxx @commonArgs $wavIoTestSrc -o $wavIoTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wav_io" }
 
-# Vendored KISS FFT -> C object, then the fft.cpp wrapper + its test linked against it.
-& $gcc -O2 -c $kissSrc -o $kissObj
-if ($LASTEXITCODE -ne 0) { throw "Failed to compile kiss_fft.c" }
-
+# FFT wrapper test + the Suppressor (STFT scaffold) test, both linked against the KISS object.
 & $gxx @commonArgs $fftTestSrc $fftSrc $kissObj -o $fftTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_fft" }
+
+& $gxx @commonArgs $suppressorTestSrc $suppressorSrc $fftSrc $kissObj -o $suppressorTestExe
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_suppressor" }
 
 Write-Host "Build complete. Executables:"
 Write-Host "  $mainExe"
@@ -84,3 +91,4 @@ Write-Host "  $captureTestExe"
 Write-Host "  $processingTestExe"
 Write-Host "  $wavIoTestExe"
 Write-Host "  $fftTestExe"
+Write-Host "  $suppressorTestExe"

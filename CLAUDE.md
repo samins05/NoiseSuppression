@@ -26,7 +26,8 @@ A real-time, device-level noise suppression pipeline in C++. It sits between a p
   - `.\build\test_wasapi_capture.exe` — expected: `WasapiCapture test passed: 7 cases (framing, mixing, silent, overflow).`
   - `.\build\test_processing_stage.exe` — expected: `ProcessingStage test passed: 4 cases (flow, identity, order, overflow).`
   - `.\build\test_wav_io.exe` — expected: `wav_io test passed: 4 cases (wav rt, raw rt, header size, clamp).` Set `WAV_TEST_DIR` to a writable dir (defaults to `.`), e.g. `$env:WAV_TEST_DIR=$env:TEMP`.
-- Adding more tests means adding a corresponding `g++` invocation to [build.ps1](build.ps1) — there is no test discovery.
+  - `.\build\test_fft.exe` — expected: `fft test passed: 5 cases (impulse, sine, roundtrip, parseval, vs-dft).`
+- Adding more tests means adding a corresponding `g++` invocation to [build.ps1](build.ps1) — there is no test discovery. The vendored KISS FFT (`src/suppressor/kiss/kiss_fft.c`) is C, not C++ — [build.ps1](build.ps1) compiles it with **gcc** into `kiss_fft.o` and links that object into `fft.cpp` (whose header calls in via `extern "C"`); it is never fed to g++.
 
 - **Golden oracle (test-only):** the suppressor DSP is verified by diffing against a reference RNNoise build, not by eyeballing. Build it once with `sh tools/oracle/setup.sh` (see [tools/oracle/README.md](tools/oracle/README.md)). It clones **RNNoise v0.1.1** into `third_party/` (gitignored), applies [tools/oracle/instrument.patch](tools/oracle/instrument.patch), and produces `rnnoise_demo.exe`. Running it with `RNNOISE_DUMP=dump.txt` emits per-frame `Ex[22]`, `features[42]`, raw RNN gains, and final gains for stage-by-stage comparison. The oracle speaks raw 16-bit PCM; bridge via `wav_io::writeRawPcm16` / `readRawPcm16`.
 
@@ -259,7 +260,11 @@ and [tools/oracle/README.md](tools/oracle/README.md) for which slice diffs again
   dumping `Ex[22]`/`features[42]`/raw+final gains; header-only WAV/raw-PCM I/O
   ([tests/wav_io.h](tests/wav_io.h), [tests/test_wav_io.cpp](tests/test_wav_io.cpp)).
   Gate met: oracle rebuilds from scratch and dumps 42 features/frame; WAV round-trip is bit-exact.
-- **Slice 1 — FFT/IFFT** (`fft.h/cpp`). 960-pt mixed-radix (port KISS FFT). Gate: impulse→flat,
+- **Slice 1 ✅ DONE — FFT/IFFT** (`fft.h/cpp`). 960-pt mixed-radix via **vendored KISS FFT**
+  (`src/suppressor/kiss/`, 6 files copied from the oracle; compiled as C, see Build & Run). The
+  `fft::Fft` wrapper keeps KISS headers out of consumers and reproduces RNNoise's exact convention
+  (forward carries the 1/N scale; inverse rebuilds the upper spectrum by Hermitian symmetry, ×N +
+  reversed index) so bands/gains match the oracle downstream. Gate met (`test_fft.exe`): impulse→flat,
   sine→single bin, `IFFT(FFT(x))==x`, Parseval, matches naive O(n²) DFT within epsilon.
 - **Slice 2 — Perfect reconstruction.** Window + overlap-add scaffold in `Suppressor` with gains
   forced to 1.0. Gate: output==input (one-frame delay), SNR > ~100 dB. *Highest-leverage test.*

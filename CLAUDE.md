@@ -269,7 +269,7 @@ and [tools/oracle/README.md](tools/oracle/README.md) for which slice diffs again
   sine→single bin, `IFFT(FFT(x))==x`, Parseval, matches naive O(n²) DFT within epsilon.
 - **Slice 2 ✅ DONE — Perfect reconstruction.** Window + overlap-add scaffold in `Suppressor`
   (`suppressor.cpp`: Vorbis half-window, 960-window = prev+current frame, FFT → gains=1.0 no-op →
-  IFFT → window → overlap-add via `analysisMem_`/`synthesisMem_`). Gate met (`test_suppressor.exe`):
+  IFFT → window → overlap-add via `previousInputFrame_`/`overlapTail_`). Gate met (`test_suppressor.exe`):
   output==input at one-frame delay, reconstruction SNR > 100 dB. `ProcessingStage` tests were
   updated to assert pump-loop wiring against a reference `Suppressor` run (no longer identity).
 - **Slice 3 — Bark bands + energies** (`bark.h/cpp` pt1). Gate: energy conservation + `Ex[22]`

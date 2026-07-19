@@ -98,6 +98,11 @@ Physical Mic
 - You do NOT own the Windows buffer — copy and release as fast as possible
 - Mode: shared (MVP), exclusive (post-MVP) — configurable parameter at init
 - MMCSS enrollment at thread startup (post-MVP but document where it goes)
+- **Stop flag:** `requestStop()` writes `stopRequested_`; `run()` only ever *reads* it. This is
+  deliberate — an earlier version had `run()` set `running_ = true` at loop entry, so a
+  `requestStop()` arriving before the thread started was silently overwritten and `join()` hung
+  forever. A separate `threadActive_` (set on `run()` entry/exit via an RAII guard) is what the
+  destructor asserts on. Same pattern in `ProcessingStage`. Regression test: `stop-before-run`.
 
 **Key Constraints:**
 - Sample rate fixed at 48kHz, frame size fixed at 480 samples — required by RNNoise downstream
@@ -126,16 +131,26 @@ NOT just band energies. Feeding a different feature set produces garbage gains. 
 - **Scale convention:** RNNoise operates on int16-magnitude floats (band energies ~1e6), while
   WASAPI capture gives `[-1, 1]`. Integration (Slice 7) scales ×32768 in, ÷32768 out.
 
-**Pipeline (target < 10ms; lenient 30–50ms budget while building, tighten later):**
+**Pipeline (target < 10ms; lenient 30–50ms budget while building, tighten later).**
+Steps marked ✅ are implemented; the rest land in the remaining slices.
 1. Receive raw frame from RawAudioBuffer; append to the rolling history buffer
-2. High-pass filter, window into the 960-sample analysis frame, FFT → spectrum
-3. Bark conversion → 22 band energies; pitch search → pitch-filtered spectrum
+2. ✅ High-pass filter, window into the 960-sample analysis frame, FFT → spectrum
+3. ✅ Bark conversion → 22 band energies *(pitch search → pitch-filtered spectrum still pending)*
 4. Feature extraction → the 42-element vector above (carries last-frame memory for deltas)
 5. GRU forward pass → 22 band gains (0.0–1.0)
 6. Pitch filter + gain smoothing, interpolate 22 band gains to FFT bins, apply
-7. Inverse FFT → time domain
-8. Overlap-add with previous frame tail → 480 clean samples
-9. Write clean frame to CleanAudioBuffer
+7. ✅ Inverse FFT → time domain
+8. ✅ Overlap-add with previous frame tail → 480 clean samples
+9. ✅ Write clean frame to CleanAudioBuffer
+
+The scaffold (2, 7, 8, 9) is complete and lossless — with gains pinned at 1.0 the pipeline
+reconstructs its input exactly, so steps 4–6 slot into a known-good frame.
+
+**High-pass filter (implemented, Slice 3).** `HighPassFilter` in `suppressor.h` — a stateful
+biquad carrying 2 floats between frames. It runs **before** analysis, and because synthesis
+reconstructs from the filtered spectrum it sits in the **audio path**, not just feature
+extraction. It is exposed (not hidden in the .cpp) so tests can build high-passed reference
+signals with the same code rather than duplicating the filter math.
 
 **Key Constraints:**
 - GRU is stateful — hidden state persists between frames, never reset mid-session
@@ -145,9 +160,9 @@ NOT just band energies. Feeding a different feature set produces garbage gains. 
 - Verified stage-by-stage against the golden oracle (see Build & Run) — every slice has a gate
 
 **File breakdown:**
-- suppressor.cpp — wires full pipeline
-- fft.h/cpp — 960-pt mixed-radix FFT + IFFT (port KISS FFT; power-of-two radix-2 is insufficient)
-- bark.h/cpp — Bark conversion + feature extraction (incl. pitch features)
+- suppressor.cpp — wires full pipeline; also holds `HighPassFilter` and exposes `lastBandEnergies()`
+- fft.h/cpp — 960-pt mixed-radix FFT + IFFT (vendored KISS FFT; power-of-two radix-2 is insufficient)
+- bark.h/cpp — Bark conversion (`computeBandEnergy` ✅) + feature extraction (incl. pitch features)
 - gru.h/cpp — GRU forward pass (matrix multiply + tanh/sigmoid activations)
 - weights.h — Mozilla's pre-trained weights as float array (from RNNoise v0.1.1 rnn_data.c)
 
@@ -190,9 +205,10 @@ noise-suppressor/
 │   │   ├── wasapi_playback.h
 │   │   └── wasapi_playback.cpp
 │   └── suppressor/
-│       ├── suppressor.h
+│       ├── suppressor.h          # Suppressor + HighPassFilter (the DC-removal biquad)
 │       ├── suppressor.cpp
-│       ├── fft.h / fft.cpp
+│       ├── fft.h / fft.cpp       # 960-pt FFT wrapper over the vendored KISS
+│       ├── kiss/                 # vendored KISS FFT (6 files, compiled as C — see Build & Run)
 │       ├── bark.h / bark.cpp
 │       ├── gru.h / gru.cpp
 │       └── weights.h
@@ -203,7 +219,8 @@ noise-suppressor/
 │   ├── wav_io.h                  # header-only WAV/raw-PCM I/O, offline test support (Slice 0)
 │   ├── test_wav_io.cpp
 │   ├── test_fft.cpp
-│   └── test_suppressor.cpp
+│   ├── test_suppressor.cpp
+│   └── test_bark.cpp             # band energies + the opt-in oracle diff harness (reused by Slices 4-7)
 ├── tools/
 │   └── oracle/                   # reproducible RNNoise golden-reference build (Slice 0)
 │       ├── setup.sh              # clones v0.1.1 -> third_party/, patches, builds rnnoise_demo.exe
@@ -239,7 +256,7 @@ Files: [src/capture/wasapi_capture.h](src/capture/wasapi_capture.h), [src/captur
 
 > **Phase order note:** Phase 4 (suppressor) is implemented **before** Phase 3 (playback). The playback thread drains `CleanAudioBuffer`, which is empty until the processing stage writes to it — so the suppressor/processing wiring has to exist first, otherwise playback has nothing to test against.
 
-### Phase 4 — Suppressor + Processing Stage 🟡 passthrough slice DONE, DSP pending
+### Phase 4 — Suppressor + Processing Stage 🟡 scaffold + bands DONE (Slices 0–3), features/GRU pending
 Files: [src/suppressor/suppressor.h](src/suppressor/suppressor.h), [src/suppressor/suppressor.cpp](src/suppressor/suppressor.cpp), [src/processing/processing_stage.h](src/processing/processing_stage.h), [src/processing/processing_stage.cpp](src/processing/processing_stage.cpp)
 - Split into two classes: **`Suppressor`** is the pure transform (`AudioFrame process(const AudioFrame&)`, no threads/buffers); **`ProcessingStage`** owns the read→process→write loop and holds `RawAudioBuffer&` + `CleanAudioBuffer&` + `Suppressor&`. `ProcessingStage` is passive like `WasapiCapture` (`run()` / `requestStop()`); `main` owns the processing `std::thread`.
 - First slice is **passthrough** — `Suppressor::process` returns its input unchanged. This verified the full capture→processing→clean wiring before any DSP exists. `process()` is a non-const member because the real pipeline will carry GRU hidden state + overlap-add tail between frames.
@@ -315,6 +332,15 @@ and [tools/oracle/README.md](tools/oracle/README.md) for which slice diffs again
 2. Passthrough test — open Discord with a friend, switch to virtual mic, talk normally
 3. Stress test — run for a full CS2 session, verify no drift, glitches, or crashes
 4. Latency measurement — measure end-to-end with timestamps at capture and playback
+
+> **Known environment gotcha — Norton blocks mic capture.** If `main.exe` dies at startup with
+> `AudioClient Initialize failed, HRESULT=0x80070006 (ERROR_INVALID_HANDLE)`, it is **Norton 360**
+> denying device access to the unsigned `build/*.exe`, not a bug in `WasapiCapture`. The tell is
+> that *every* capture endpoint fails identically in every share/flag mode while Windows' own gates
+> all say allow (ConsentStore `Allow`, no AppPrivacy policy, audio services running). Fix: add a
+> Norton exclusion for the build directory. Diagnosed 2026-07-18 — buffer duration, share mode, COM
+> apartment (STA vs MTA), and the MinGW toolchain were all ruled out first, so don't re-chase them.
+> None of this blocks DSP work: Slices 3–7 are verified offline against the oracle, no mic needed.
 
 ---
 

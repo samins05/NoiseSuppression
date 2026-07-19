@@ -24,7 +24,10 @@ public:
     ProcessingStage& operator=(const ProcessingStage&) = delete;
 
     void run();          // loop until requestStop(): read input → process → write output
-    void requestStop();  // flip the flag; the loop observes it within one yield cycle
+    // Flip the stop flag; the loop observes it within one yield cycle. Safe to call before the
+    // run() thread has started — run() only reads the flag, so an early stop makes run() return
+    // immediately rather than being overwritten. One-shot per run cycle.
+    void requestStop();
 
     // One iteration of run()'s loop: read a frame from input, suppress it, write to output.
     // Returns true if a frame was read (a full output counts as a drop, still "did work");
@@ -42,7 +45,9 @@ private:
     RingBuffer<AudioFrame>& input_;
     RingBuffer<AudioFrame>& output_;
     Suppressor& suppressor_;
-    std::atomic<bool> running_{false};
+    // Written only by requestStop(), only read by run() — so a stop racing ahead of the thread
+    // entering run() cannot be clobbered.
+    std::atomic<bool> stopRequested_{false};
     std::atomic<uint64_t> framesProcessed_{0};
     std::atomic<uint64_t> framesDropped_{0};
 };

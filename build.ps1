@@ -13,9 +13,11 @@ $captureTestSrc = Join-Path $PSScriptRoot 'tests\test_wasapi_capture.cpp'
 $processingTestSrc = Join-Path $PSScriptRoot 'tests\test_processing_stage.cpp'
 $wavIoTestSrc = Join-Path $PSScriptRoot 'tests\test_wav_io.cpp'
 $fftSrc        = Join-Path $PSScriptRoot 'src\suppressor\fft.cpp'
+$barkSrc       = Join-Path $PSScriptRoot 'src\suppressor\bark.cpp'
 $kissSrc       = Join-Path $PSScriptRoot 'src\suppressor\kiss\kiss_fft.c'
 $fftTestSrc    = Join-Path $PSScriptRoot 'tests\test_fft.cpp'
 $suppressorTestSrc = Join-Path $PSScriptRoot 'tests\test_suppressor.cpp'
+$barkTestSrc   = Join-Path $PSScriptRoot 'tests\test_bark.cpp'
 $mainExe    = Join-Path $buildDir 'main.exe'
 $testExe    = Join-Path $buildDir 'test_ring_buffer.exe'
 $captureTestExe = Join-Path $buildDir 'test_wasapi_capture.exe'
@@ -24,6 +26,7 @@ $wavIoTestExe = Join-Path $buildDir 'test_wav_io.exe'
 $kissObj    = Join-Path $buildDir 'kiss_fft.o'
 $fftTestExe = Join-Path $buildDir 'test_fft.exe'
 $suppressorTestExe = Join-Path $buildDir 'test_suppressor.exe'
+$barkTestExe = Join-Path $buildDir 'test_bark.exe'
 
 # Windows audio link libs (only needed by main, not the test).
 # -lole32  : CoInitializeEx, CoCreateInstance, CoTaskMemFree
@@ -61,7 +64,7 @@ $commonArgs = @('-std=c++17', '-pthread',
 & $gcc -O2 -c $kissSrc -o $kissObj
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile kiss_fft.c" }
 
-& $gxx @commonArgs $mainSrc $captureSrc $suppressorSrc $processingSrc $fftSrc $kissObj -o $mainExe @winAudioLibs
+& $gxx @commonArgs $mainSrc $captureSrc $suppressorSrc $processingSrc $fftSrc $barkSrc $kissObj -o $mainExe @winAudioLibs
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile main + capture + suppressor + processing" }
 
 & $gxx @commonArgs $testSrc -o $testExe
@@ -70,7 +73,7 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_ring_buffer.cpp" }
 & $gxx @commonArgs $captureTestSrc $captureSrc -o $captureTestExe @winAudioLibs
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wasapi_capture" }
 
-& $gxx @commonArgs $processingTestSrc $processingSrc $suppressorSrc $fftSrc $kissObj -o $processingTestExe
+& $gxx @commonArgs $processingTestSrc $processingSrc $suppressorSrc $fftSrc $barkSrc $kissObj -o $processingTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_processing_stage" }
 
 # Header-only WAV/raw-PCM helper (tests/wav_io.h) — offline test support, no extra .cpp.
@@ -81,8 +84,11 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_wav_io" }
 & $gxx @commonArgs $fftTestSrc $fftSrc $kissObj -o $fftTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_fft" }
 
-& $gxx @commonArgs $suppressorTestSrc $suppressorSrc $fftSrc $kissObj -o $suppressorTestExe
+& $gxx @commonArgs $suppressorTestSrc $suppressorSrc $fftSrc $barkSrc $kissObj -o $suppressorTestExe
 if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_suppressor" }
+
+& $gxx @commonArgs $barkTestSrc $suppressorSrc $fftSrc $barkSrc $kissObj -o $barkTestExe
+if ($LASTEXITCODE -ne 0) { throw "Failed to compile test_bark" }
 
 Write-Host "Build complete. Executables:"
 Write-Host "  $mainExe"
@@ -92,3 +98,4 @@ Write-Host "  $processingTestExe"
 Write-Host "  $wavIoTestExe"
 Write-Host "  $fftTestExe"
 Write-Host "  $suppressorTestExe"
+Write-Host "  $barkTestExe"

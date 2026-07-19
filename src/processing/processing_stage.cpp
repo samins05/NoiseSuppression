@@ -8,9 +8,9 @@ ProcessingStage::ProcessingStage(RingBuffer<AudioFrame>& input,
     : input_(input), output_(output), suppressor_(suppressor) {}
 
 void ProcessingStage::run() {
-    running_.store(true, std::memory_order_release);
-
-    while (running_.load(std::memory_order_acquire)) {
+    // run() never writes the stop flag — only reads it — so a requestStop() that lands before the
+    // thread gets here is honored instead of being overwritten.
+    while (!stopRequested_.load(std::memory_order_acquire)) {
         if (!pumpOnce()) {
             std::this_thread::yield(); // input empty — nothing to process yet
         }
@@ -32,5 +32,5 @@ bool ProcessingStage::pumpOnce() {
 }
 
 void ProcessingStage::requestStop() {
-    running_.store(false, std::memory_order_release);
+    stopRequested_.store(true, std::memory_order_release);
 }

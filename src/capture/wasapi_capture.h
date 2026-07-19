@@ -31,7 +31,10 @@ public:
     void shutdown();     // Release WASAPI handles in reverse order. Idempotent.
 
     void run();          // Hot loop. Blocks until requestStop() is called.
-    void requestStop();  // Set the stop flag and wake the hot loop. Safe to call from any thread.
+    // Set the stop flag and wake the hot loop. Safe to call from any thread, and safe to call
+    // *before* the run() thread has started — run() only ever reads the flag, so an early stop
+    // makes run() return immediately instead of being overwritten. One-shot per run cycle.
+    void requestStop();
 
     // Accumulate audio into fixed 480-sample AudioFrames, and write each completed frame to the
     // output ring buffer (bumping framesProduced/framesDropped) 
@@ -47,7 +50,11 @@ public:
 
 private:
     RingBuffer<AudioFrame>& output_;
-    std::atomic<bool> running_{false};
+    // Split deliberately: stopRequested_ is written only by requestStop(), so a stop that races
+    // ahead of the thread entering run() cannot be clobbered. threadActive_ tracks whether a
+    // thread is currently inside run(), which is what the destructor asserts on.
+    std::atomic<bool> stopRequested_{false};
+    std::atomic<bool> threadActive_{false};
     std::atomic<uint64_t> framesProduced_{0};
     std::atomic<uint64_t> framesDropped_{0};
 

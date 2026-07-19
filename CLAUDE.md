@@ -24,10 +24,16 @@ A real-time, device-level noise suppression pipeline in C++. It sits between a p
 - **Run tests:**
   - `.\build\test_ring_buffer.exe` — expected: `Ring buffer test passed: 100000 ordered items.`
   - `.\build\test_wasapi_capture.exe` — expected: `WasapiCapture test passed: 7 cases (framing, mixing, silent, overflow).`
-  - `.\build\test_processing_stage.exe` — expected: `ProcessingStage test passed: 4 cases (flow, empty-input, order, overflow).`
+  - `.\build\test_processing_stage.exe` — expected: `ProcessingStage test passed: 5 cases (flow, empty-input, order, overflow, stop-before-run).`
   - `.\build\test_wav_io.exe` — expected: `wav_io test passed: 4 cases (wav rt, raw rt, header size, clamp).` Set `WAV_TEST_DIR` to a writable dir (defaults to `.`), e.g. `$env:WAV_TEST_DIR=$env:TEMP`.
   - `.\build\test_fft.exe` — expected: `fft test passed: 5 cases (impulse, sine, roundtrip, parseval, vs-dft).`
-  - `.\build\test_suppressor.exe` — expected: `suppressor test passed: 2 cases (reconstruction-snr, first-frame-silent).`
+  - `.\build\test_suppressor.exe` — expected: `suppressor test passed: 7 cases (tone, noise, transient, dc, silence, long-run, first-frame-silent).`
+  - `.\build\test_bark.exe` — expected: `bark test passed: 4 cases (energy-conservation, layout, zero, spike) + oracle diff.` The oracle diff is opt-in; without `ORACLE_DUMP`/`ORACLE_INPUT` it prints `oracle diff skipped` and the suite stays hermetic. To run it:
+    ```
+    .\build\test_bark.exe --gen-input noisy.pcm
+    RNNOISE_DUMP=dump.txt third_party/rnnoise_classic/rnnoise_demo.exe noisy.pcm clean.pcm
+    $env:ORACLE_DUMP='dump.txt'; $env:ORACLE_INPUT='noisy.pcm'; .\build\test_bark.exe
+    ```
 - Adding more tests means adding a corresponding `g++` invocation to [build.ps1](build.ps1) — there is no test discovery. The vendored KISS FFT (`src/suppressor/kiss/kiss_fft.c`) is C, not C++ — [build.ps1](build.ps1) compiles it with **gcc** into `kiss_fft.o` and links that object into `fft.cpp` (whose header calls in via `extern "C"`); it is never fed to g++.
 
 - **Golden oracle (test-only):** the suppressor DSP is verified by diffing against a reference RNNoise build, not by eyeballing. Build it once with `sh tools/oracle/setup.sh` (see [tools/oracle/README.md](tools/oracle/README.md)). It clones **RNNoise v0.1.1** into `third_party/` (gitignored), applies [tools/oracle/instrument.patch](tools/oracle/instrument.patch), and produces `rnnoise_demo.exe`. Running it with `RNNOISE_DUMP=dump.txt` emits per-frame `Ex[22]`, `features[42]`, raw RNN gains, and final gains for stage-by-stage comparison. The oracle speaks raw 16-bit PCM; bridge via `wav_io::writeRawPcm16` / `readRawPcm16`.
@@ -272,8 +278,16 @@ and [tools/oracle/README.md](tools/oracle/README.md) for which slice diffs again
   IFFT → window → overlap-add via `previousInputFrame_`/`overlapTail_`). Gate met (`test_suppressor.exe`):
   output==input at one-frame delay, reconstruction SNR > 100 dB. `ProcessingStage` tests were
   updated to assert pump-loop wiring against a reference `Suppressor` run (no longer identity).
-- **Slice 3 — Bark bands + energies** (`bark.h/cpp` pt1). Gate: energy conservation + `Ex[22]`
-  matches oracle.
+- **Slice 3 ✅ DONE — Bark bands + energies** (`bark.h/cpp`). 22-band triangular filterbank
+  (`computeBandEnergy`, ported from `denoise.c compute_band_energy`; bins 0–400, the top octave is
+  unused by design). Also landed the **high-pass biquad** the earlier slices skipped — it is
+  pipeline step 2, it is stateful across frames, and because synthesis reconstructs from the
+  filtered spectrum it sits in the *audio* path, not just analysis. Exposed as `HighPassFilter` in
+  `suppressor.h` so tests build high-passed references without duplicating the filter. `Suppressor`
+  now computes `Ex` each frame, readable via `lastBandEnergies()`. Gate met (`test_bark.exe`):
+  energy conservation, band layout, zero/spike cases, and **`Ex[22]` bit-exact vs the oracle over
+  300 frames**. `test_suppressor.cpp` was retargeted to score against the high-passed reference
+  (the DC case now asserts absolute error, since the filter removes DC and an SNR ratio degenerates).
 - **Slice 4 — Features: BFCC + deltas** (`bark.h/cpp` pt2). 34 of 42 features. Gate: `features[0..33]`
   match oracle.
 - **Slice 5 — Pitch features.** Rolling history buffer + autocorrelation pitch search → final 8

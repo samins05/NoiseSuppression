@@ -12,6 +12,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -19,13 +20,17 @@ namespace {
 
 // 480 samples = 10 ms at 48 kHz, which is what RNNoise expects
 constexpr uint32_t        kTargetSampleRate = 48000; // kFrameSamples is how many samples we emit in each AudioFrame
-constexpr uint32_t        kFrameSamples     = 480;     // Accumulate mic packets into fixed-size frames of 480 samples 
-constexpr REFERENCE_TIME  kBufferDur        = 200000;  // kBufferDur is the requested buffer duration for the WASAPI shared buffer 
+constexpr uint32_t        kFrameSamples     = 480;     // Accumulate mic packets into fixed-size frames of 480 samples
+constexpr REFERENCE_TIME  kBufferDur        = 200000;  // kBufferDur is the requested buffer duration for the WASAPI shared buffer
 
 void throwIfFailed(HRESULT hr, const char* what) {
     if (FAILED(hr)) {
-        throw std::runtime_error(std::string(what) + " failed, HRESULT=0x" +
-                                 std::to_string(static_cast<unsigned long>(hr)));
+        // std::to_string would print decimal under an "0x" prefix — format as actual hex so the
+        // HRESULT can be looked up directly (e.g. 0x80070006 = ERROR_INVALID_HANDLE).
+        std::ostringstream oss;
+        oss << what << " failed, HRESULT=0x" << std::hex << std::uppercase
+            << static_cast<unsigned long>(hr);
+        throw std::runtime_error(oss.str());
     }
 }
 
@@ -35,8 +40,8 @@ WasapiCapture::WasapiCapture(RingBuffer<AudioFrame>& output) : output_(output) {
 
 WasapiCapture::~WasapiCapture() {
     // Contract: caller must have already requestStop()'d and joined the thread running run().
-    // If the flag is still set we'd be tearing down WASAPI underneath a live thread.
-    assert(!running_.load(std::memory_order_acquire) && "destroyed while run() thread still active");
+    // If a thread is still inside run() we'd be tearing down WASAPI underneath it.
+    assert(!threadActive_.load(std::memory_order_acquire) && "destroyed while run() thread still active");
     shutdown();
 }
 
@@ -95,6 +100,16 @@ void WasapiCapture::initialize() {
     CoTaskMemFree(mixFormat); // Initialize copied what it needed; mixFormat done with.
     throwIfFailed(initHr, "AudioClient Initialize");
 
+    // The size we requested is not binding — the engine allocates at least that much and rounds to
+    // whole frames, so read back what we actually got. It bounds how much audio can queue up before
+    // we must drain, i.e. our latency budget.
+    UINT32 bufferFrames = 0;
+    if (SUCCEEDED(audioClient_->GetBufferSize(&bufferFrames))) {
+        std::cout << "WASAPI buffer: " << bufferFrames << " frames ("
+                  << (deviceSampleRate_ ? (bufferFrames * 1000.0 / deviceSampleRate_) : 0.0)
+                  << " ms)\n";
+    }
+
     // Wire up the event handle + grab the capture client
     // CreateEventW makes the kernel event the audio engine will signal
     eventHandle_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -108,6 +123,16 @@ void WasapiCapture::initialize() {
 }
 
 void WasapiCapture::run() {
+    // Flag the thread as inside run() for the whole scope, including the early-return paths below,
+    // so the destructor's assert can actually tell whether a thread is still live in here.
+    struct ActiveGuard {
+        std::atomic<bool>& flag;
+        explicit ActiveGuard(std::atomic<bool>& f) : flag(f) {
+            flag.store(true, std::memory_order_release);
+        }
+        ~ActiveGuard() { flag.store(false, std::memory_order_release); }
+    } activeGuard(threadActive_);
+
     // Each COM-using thread must CoInitialize.
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
@@ -118,12 +143,12 @@ void WasapiCapture::run() {
         return;
     }
 
-    running_.store(true, std::memory_order_release);
-
-    while (running_.load(std::memory_order_acquire)) {
+    // Note: run() never writes the stop flag — it only reads it. A requestStop() that lands before
+    // this point is therefore honored (the loop exits immediately) rather than being overwritten.
+    while (!stopRequested_.load(std::memory_order_acquire)) {
         DWORD wait = WaitForSingleObject(static_cast<HANDLE>(eventHandle_), 200);
         if (wait != WAIT_OBJECT_0) {
-            continue; // timeout or wake from requestStop() — re-check running_
+            continue; // timeout or wake from requestStop() — re-check the stop flag
         }
 
         UINT32 packetSize = 0;
@@ -177,9 +202,9 @@ void WasapiCapture::ingestSamples(const float* samples, uint32_t numFrames, uint
 }
 
 void WasapiCapture::requestStop() {
-    running_.store(false, std::memory_order_release);
+    stopRequested_.store(true, std::memory_order_release);
     if (eventHandle_) {
-        SetEvent(static_cast<HANDLE>(eventHandle_)); // wake the hot loop so it can observe running_
+        SetEvent(static_cast<HANDLE>(eventHandle_)); // wake the hot loop so it observes the flag
     }
 }
 

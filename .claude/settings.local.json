@@ -34,7 +34,15 @@
       "Bash(echo \"exit: $?\")",
       "Bash(git clone *)",
       "PowerShell(.\\\\build.ps1 2>&1 | Select-Object -Last 8; Write-Host \"=== run wav_io test ===\"; $env:WAV_TEST_DIR=$env:TEMP; .\\\\build\\\\test_wav_io.exe)",
-      "Bash(sh tools/oracle/setup.sh)"
+      "Bash(sh tools/oracle/setup.sh)",
+      "PowerShell(.\\\\build.ps1 2>&1 | Select-Object -Last 12)",
+      "PowerShell(.\\\\build\\\\main.exe)",
+      "PowerShell($tmp = \"$env:USERPROFILE\\\\.claude\\\\jobs\\\\e0002954\\\\tmp\"; & 'C:\\\\msys64\\\\mingw64\\\\bin\\\\g++.exe' -std=c++17 -static -static-libgcc -static-libstdc++ \"$tmp\\\\wasapi_probe.cpp\" -o \"$tmp\\\\wasapi_probe.exe\" -lole32 -loleaut32 -lksuser; if \\($?\\) { & \"$tmp\\\\wasapi_probe.exe\" })",
+      "PowerShell(Get-Service *)",
+      "PowerShell(& \"$env:USERPROFILE\\\\.claude\\\\jobs\\\\e0002954\\\\tmp\\\\wasapi_probe.exe\" 2>&1 | Select-String -Pattern \"^\\\\[|EVENTCALLBACK, dur=0|IsFormatSupported\")",
+      "Bash(./build/main.exe)",
+      "PowerShell(Get-PnpDevice *)",
+      "PowerShell(Get-Process *)"
     ]
   }
 }

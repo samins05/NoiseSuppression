@@ -4,6 +4,10 @@
 #include "../src/core/audio_frame.h"
 
 #include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <future>
 #include <iostream>
 
 namespace {
@@ -87,6 +91,23 @@ void test_drop_when_clean_full() {
     assert(ps.framesDropped() == 1);
 }
 
+// Regression test for the startup race: a requestStop() that lands BEFORE the thread enters run()
+// must still be honored. The old code did `running_ = true` at the top of run(), which clobbered
+// the stop and left the loop spinning forever (join would hang).
+void test_stop_before_run_is_honored() {
+    RingBuffer<AudioFrame> raw(8), clean(8);
+    Suppressor sup;
+    ProcessingStage ps(raw, clean, sup);
+
+    ps.requestStop(); // stop arrives first — before run() is ever entered
+
+    auto fut = std::async(std::launch::async, [&ps] { ps.run(); });
+    if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+        std::fprintf(stderr, "run() never returned after an early requestStop() — race regressed\n");
+        std::abort(); // abort rather than return: ~future would block forever on the stuck thread
+    }
+}
+
 } // namespace
 
 int main() {
@@ -94,7 +115,9 @@ int main() {
     test_empty_input_is_noop();
     test_multiple_frames_in_order();
     test_drop_when_clean_full();
+    test_stop_before_run_is_honored();
 
-    std::cout << "ProcessingStage test passed: 4 cases (flow, empty-input, order, overflow)." << std::endl;
+    std::cout << "ProcessingStage test passed: 5 cases (flow, empty-input, order, overflow, "
+                 "stop-before-run)." << std::endl;
     return 0;
 }
